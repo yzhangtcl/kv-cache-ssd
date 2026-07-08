@@ -49,6 +49,107 @@ def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:160] or "sample"
 
 
+def _normalize_for_guardrail(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\b(user|assistant|system)\b", " ", text)
+    text = re.sub(r"[^a-z0-9.%$:/-]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _number_tokens(text: str) -> list[str]:
+    return re.findall(r"(?<![A-Za-z0-9])[$]?\d+(?:[.,]\d+)?%?(?![A-Za-z0-9])", text)
+
+
+def _word_tokens(text: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", _normalize_for_guardrail(text))
+        if token not in {"a", "an", "the"}
+    ]
+
+
+def _is_subsequence(needle: list[str], haystack: list[str]) -> bool:
+    if not needle:
+        return False
+    cursor = 0
+    for token in haystack:
+        if token == needle[cursor]:
+            cursor += 1
+            if cursor == len(needle):
+                return True
+    return False
+
+
+def _is_allowed_missing_suffix(missing: list[str]) -> bool:
+    if not missing:
+        return True
+    suffix = " ".join(missing)
+    if suffix in {"each way", "one way", "round trip"}:
+        return True
+    return missing[0] in {
+        "in",
+        "at",
+        "from",
+        "to",
+        "for",
+        "on",
+        "downtown",
+        "nearby",
+        "local",
+    }
+
+
+def apply_judge_guardrails(
+    *,
+    question: str,
+    answer: str,
+    hypothesis: str,
+    label: bool,
+) -> tuple[bool, list[str]]:
+    reasons = []
+    answer_norm = _normalize_for_guardrail(answer)
+    hypothesis_norm = _normalize_for_guardrail(hypothesis)
+    if not answer_norm or not hypothesis_norm:
+        return label, reasons
+
+    answer_numbers = _number_tokens(answer_norm)
+    hypothesis_numbers = _number_tokens(hypothesis_norm)
+    if answer_numbers:
+        if answer_numbers != hypothesis_numbers:
+            return False, [f"number_mismatch:{answer_numbers}!={hypothesis_numbers}"]
+
+    answer_words = _word_tokens(answer)
+    hypothesis_words = _word_tokens(hypothesis)
+    if len(answer_words) >= 2 and _is_subsequence(hypothesis_words, answer_words) and hypothesis_words != answer_words:
+        coverage = len(hypothesis_words) / max(1, len(answer_words))
+        missing_suffix = answer_words[len(hypothesis_words) :] if answer_words[: len(hypothesis_words)] == hypothesis_words else []
+        proper_phrase = any(ch.isupper() for ch in answer) or any(
+            keyword in question.lower()
+            for keyword in (
+                "name",
+                "playlist",
+                "play",
+                "book",
+                "movie",
+                "song",
+                "degree",
+                "certification",
+                "event",
+                "brand",
+                "breed",
+            )
+        )
+        if _is_allowed_missing_suffix(missing_suffix):
+            return label, reasons
+        if proper_phrase or coverage < 0.75:
+            return False, [f"incomplete_answer_span:{' '.join(hypothesis_words)}<{' '.join(answer_words)}"]
+
+    if answer_norm not in hypothesis_norm and hypothesis_norm not in answer_norm:
+        return label, reasons
+    return label, reasons
+
+
 def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -242,6 +343,7 @@ def judge_with_deepseek(
     timeout: int,
     max_retries: int,
     lenient: bool,
+    guardrails: bool,
 ) -> dict[str, Any]:
     qid = str(entry["question_id"])
     prompt = get_anscheck_prompt(
@@ -260,11 +362,24 @@ def judge_with_deepseek(
         timeout=timeout,
         max_retries=max_retries,
     )
+    raw_label = "yes" in response.lower()
+    label = raw_label
+    guardrail_reasons: list[str] = []
+    if guardrails:
+        label, guardrail_reasons = apply_judge_guardrails(
+            question=str(entry["question"]),
+            answer=str(entry["answer"]),
+            hypothesis=hypothesis,
+            label=raw_label,
+        )
     return {
         "model": model,
         "lenient": lenient,
+        "guardrails": guardrails,
         "raw_response": response,
-        "label": "yes" in response.lower(),
+        "raw_label": raw_label,
+        "guardrail_reasons": guardrail_reasons,
+        "label": label,
     }
 
 
@@ -291,6 +406,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-thinking", choices=("auto", "0", "1"), default="auto")
     parser.add_argument("--judge", action="store_true", help="Call DeepSeek API and write eval labels.")
     parser.add_argument("--judge-lenient", action="store_true", help="Use a looser short-answer equivalence prompt for DeepSeek judging.")
+    parser.add_argument("--no-judge-guardrails", action="store_true", help="Disable deterministic guardrails for obvious judge mistakes.")
     parser.add_argument("--judge-existing", action="store_true", help="Only judge existing predictions.")
     parser.add_argument("--deepseek-api-key", default=os.environ.get("DEEPSEEK_API_KEY"))
     parser.add_argument("--deepseek-model", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"))
@@ -314,6 +430,14 @@ def main() -> None:
 
     predictions = _load_jsonl_by_qid(out_file)
     evals = _load_jsonl_by_qid(eval_log)
+    if args.judge_existing and not predictions:
+        log_progress(
+            "warning_no_existing_predictions",
+            {
+                "out_file": str(out_file),
+                "message": "--judge-existing was set, but no predictions were loaded from --out-file.",
+            },
+        )
 
     if args.judge_existing:
         model = None
@@ -356,6 +480,15 @@ def main() -> None:
         if qid in predictions:
             hypothesis = str(predictions[qid].get("hypothesis", ""))
             print(f"[{idx}] skip generated {qid}")
+        elif args.judge_existing:
+            log_progress(
+                "skip_missing_prediction",
+                {
+                    "index": idx,
+                    "question_id": qid,
+                    "out_file": str(out_file),
+                },
+            )
         elif not args.judge_existing:
             assert model is not None and tokenizer is not None
             prompt = build_prompt(entry, history_format=args.history_format, user_only=args.user_only)
@@ -436,6 +569,7 @@ def main() -> None:
                 timeout=args.deepseek_timeout,
                 max_retries=args.deepseek_max_retries,
                 lenient=args.judge_lenient,
+                guardrails=not args.no_judge_guardrails,
             )
             log_entry = {
                 "question_id": qid,
