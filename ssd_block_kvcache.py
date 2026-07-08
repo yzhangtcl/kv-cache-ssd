@@ -182,6 +182,42 @@ def _new_dynamic_cache(cls, model=None):
             return None
 
 
+def _cache_layers(past_key_values) -> list:
+    layers = getattr(past_key_values, "layers", None)
+    if layers is None:
+        return []
+    try:
+        return list(layers)
+    except TypeError:
+        return []
+
+
+def _copy_linear_attention_state(target_cache, source_cache) -> None:
+    target_layers = _cache_layers(target_cache)
+    source_layers = _cache_layers(source_cache)
+    if not target_layers or not source_layers:
+        return
+
+    for target_layer, source_layer in zip(target_layers, source_layers):
+        for attr in ("conv_states", "recurrent_states"):
+            value = getattr(source_layer, attr, None)
+            if isinstance(value, torch.Tensor):
+                setattr(target_layer, attr, value.detach().clone())
+
+
+def _clone_linear_attention_cache(past_key_values, model=None):
+    if past_key_values is None:
+        return None
+    cls = _dynamic_cache_cls()
+    if cls is None:
+        return None
+    cache = _new_dynamic_cache(cls, model=model)
+    if cache is None:
+        return None
+    _copy_linear_attention_state(cache, past_key_values)
+    return cache
+
+
 def _legacy_tuple_to_dynamic_cache(past_key_values: PastKeyValues, model=None):
     cls = _dynamic_cache_cls()
     if cls is None:
@@ -212,11 +248,14 @@ def _legacy_tuple_to_dynamic_cache(past_key_values: PastKeyValues, model=None):
         return past_key_values
 
 
-def _to_model_cache(past_key_values, model=None):
+def _to_model_cache(past_key_values, model=None, linear_state_cache=None):
     if past_key_values is None or hasattr(past_key_values, "get_seq_length"):
         return past_key_values
     if isinstance(past_key_values, tuple):
-        return _legacy_tuple_to_dynamic_cache(past_key_values, model=model)
+        cache = _legacy_tuple_to_dynamic_cache(past_key_values, model=model)
+        if cache is not past_key_values and linear_state_cache is not None:
+            _copy_linear_attention_state(cache, linear_state_cache)
+        return cache
     return past_key_values
 
 
@@ -784,9 +823,10 @@ def _forward_with_cache(
     *,
     past_key_values,
     position_start: int,
+    linear_state_cache=None,
 ):
     past_len = _cache_seq_len(past_key_values)
-    model_cache = _to_model_cache(past_key_values, model=model)
+    model_cache = _to_model_cache(past_key_values, model=model, linear_state_cache=linear_state_cache)
     if isinstance(model_cache, tuple):
         model_type = getattr(getattr(model, "config", None), "model_type", "")
         if "qwen3_5" in str(model_type).lower():
@@ -985,6 +1025,7 @@ def generate_with_ssd_block_kv(
     rotary = RotaryEmbeddingAdapter.from_model(model, head_dim=head_dim)
     store = SSDBlockKVStore(ssd_dir, config, rotary, reset=True)
     store.add_past_key_values(past_key_values, token_start=0)
+    linear_state_cache = _clone_linear_attention_cache(past_key_values, model=model)
 
     initial_query = _mean_last_key_query(
         past_key_values,
@@ -1038,7 +1079,9 @@ def generate_with_ssd_block_kv(
                 next_token,
                 past_key_values=gpu_cache,
                 position_start=replay_position,
+                linear_state_cache=linear_state_cache,
             )
+        linear_state_cache = _clone_linear_attention_cache(out.past_key_values, model=model)
 
         new_tail = _unrotated_tail_from_last_token(
             out.past_key_values,

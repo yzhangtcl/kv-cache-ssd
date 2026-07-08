@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
 def _shape(value):
@@ -37,6 +38,31 @@ def main() -> None:
     prompt = os.environ.get("INSPECT_PROMPT", "请用一句话解释 KV cache。")
     max_layers = int(os.environ.get("INSPECT_MAX_LAYERS", "80"))
 
+    print("model_path:", model_path)
+    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    print("model_type:", getattr(cfg, "model_type", None))
+    print("architectures:", getattr(cfg, "architectures", None))
+    quantization_config = getattr(cfg, "quantization_config", None)
+    if quantization_config is not None:
+        print("quantization_config:", quantization_config)
+    cfg_dict = cfg.to_dict()
+    if (
+        "fp8" in model_path.lower()
+        or "finegrained_fp8" in str(quantization_config).lower()
+        or "fp8" in str(quantization_config).lower()
+    ) and os.environ.get("INSPECT_ALLOW_FP8") != "1":
+        print(
+            "Refusing to load an FP8 checkpoint for cache inspection. "
+            "Set MODEL_DIR to the Qwen3.5-9B directory, or set INSPECT_ALLOW_FP8=1 if this is intentional.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if int(getattr(cfg, "num_hidden_layers", 0) or cfg_dict.get("num_hidden_layers", 0) or 0) > 48:
+        print(
+            "Warning: this config has more than 48 layers; check that MODEL_DIR is not still pointing at the 27B model.",
+            file=sys.stderr,
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -52,7 +78,6 @@ def main() -> None:
         out = model(**inputs, use_cache=True)
 
     cache = out.past_key_values
-    print("model_path:", model_path)
     print("model_type:", getattr(model.config, "model_type", None))
     print("cache_type:", type(cache))
     if hasattr(cache, "get_seq_length"):
