@@ -11,6 +11,7 @@ from ssd_block_kvcache import (
     RotaryEmbeddingAdapter,
     SSDBlockKVConfig,
     SSDBlockKVStore,
+    _attention_layer_indices,
     _cache_entries,
     _clone_linear_attention_cache,
     _forward_with_cache,
@@ -41,6 +42,19 @@ def _top_tokens(tokenizer, logits: torch.Tensor, k: int = 5) -> list[tuple[int, 
     return out
 
 
+def _cache_attention_layer_indices(past_key_values) -> list[int]:
+    layers = getattr(past_key_values, "layers", None)
+    if layers is None:
+        return []
+    out = []
+    for idx, layer in enumerate(layers):
+        key = getattr(layer, "keys", None)
+        value = getattr(layer, "values", None)
+        if isinstance(key, torch.Tensor) and isinstance(value, torch.Tensor):
+            out.append(idx)
+    return out
+
+
 def main() -> None:
     model_path = os.environ.get("MODEL_DIR", "/root/blockdata/data/models/qwen3.5-9b")
     ssd_dir = os.environ.get("SSD_DIR", "/root/blockdata/data/kvssd-debug")
@@ -67,6 +81,8 @@ def main() -> None:
 
     prefill_entries = _cache_entries(prefill.past_key_values)
     print("attention_kv_layers:", len(prefill_entries))
+    print("inferred_attention_layer_indices:", _attention_layer_indices(model, len(prefill_entries)))
+    print("cache_attention_layer_indices:", _cache_attention_layer_indices(prefill.past_key_values))
     print("prefill_top5:", _top_tokens(tokenizer, prefill.logits))
 
     next_token = torch.argmax(prefill.logits[:, -1, :], dim=-1, keepdim=True)
@@ -105,6 +121,20 @@ def main() -> None:
         value_diff = (prefill_entries[0][1] - replay_entries[0][1]).float().abs().max().item()
         print("layer0_key_max_abs_diff:", key_diff)
         print("layer0_value_max_abs_diff:", value_diff)
+        all_key_diff = max(
+            (ref_key - replay_key).float().abs().max().item()
+            for (ref_key, _), (replay_key, _) in zip(prefill_entries, replay_entries)
+        )
+        all_value_diff = max(
+            (ref_value - replay_value).float().abs().max().item()
+            for (_, ref_value), (_, replay_value) in zip(prefill_entries, replay_entries)
+        )
+        print("all_layers_key_max_abs_diff:", all_key_diff)
+        print("all_layers_value_max_abs_diff:", all_value_diff)
+
+    exact_attention_tuple = tuple(
+        (key.detach().clone(), value.detach().clone()) for key, value in prefill_entries
+    )
 
     linear_state_cache = _clone_linear_attention_cache(prefill.past_key_values, model=model)
     with torch.inference_mode():
@@ -113,6 +143,13 @@ def main() -> None:
             next_token,
             past_key_values=prefill.past_key_values,
             position_start=prompt_len,
+        )
+        exact_tuple = _forward_with_cache(
+            model,
+            next_token,
+            past_key_values=exact_attention_tuple,
+            position_start=prompt_len,
+            linear_state_cache=linear_state_cache,
         )
         ssd = _forward_with_cache(
             model,
@@ -123,9 +160,13 @@ def main() -> None:
         )
 
     diff = (ref.logits[:, -1, :].float() - ssd.logits[:, -1, :].float()).abs()
+    exact_diff = (ref.logits[:, -1, :].float() - exact_tuple.logits[:, -1, :].float()).abs()
+    print("exact_tuple_logits_max_abs_diff:", exact_diff.max().item())
+    print("exact_tuple_logits_mean_abs_diff:", exact_diff.mean().item())
     print("next_step_logits_max_abs_diff:", diff.max().item())
     print("next_step_logits_mean_abs_diff:", diff.mean().item())
     print("ref_top5:", _top_tokens(tokenizer, ref.logits))
+    print("exact_tuple_top5:", _top_tokens(tokenizer, exact_tuple.logits))
     print("ssd_top5:", _top_tokens(tokenizer, ssd.logits))
 
 

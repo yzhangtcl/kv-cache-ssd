@@ -24,7 +24,9 @@ class SSDBlockKVConfig:
     `block_size` tokens form one searchable block. By default a block is
     represented by one mean de-rotated key vector from `summary_layer`. Setting
     `summary_centroids_per_block` above 1 splits tokens inside a block with a
-    small KD-tree-style partition and stores one mean per partition.
+    small KD-tree-style partition and stores one mean per partition. With
+    `dtype_on_ssd=None`, de-rotated keys are stored in float32 so RoPE round
+    trips remain close to exact; values keep their model dtype.
     """
 
     block_size: int = 256
@@ -641,10 +643,9 @@ class SSDBlockKVStore:
                         )
                     )
 
-            key_unrotated = torch.cat(key_parts, dim=2).to(device=target_device)
+            key_unrotated = torch.cat(key_parts, dim=2).to(device=target_device, dtype=torch.float32)
             value = torch.cat(value_parts, dim=2).to(device=target_device)
             if dtype is not None:
-                key_unrotated = key_unrotated.to(dtype)
                 value = value.to(dtype)
 
             length = int(key_unrotated.shape[-2])
@@ -658,6 +659,8 @@ class SSDBlockKVStore:
                     dtype=torch.long,
                 )
             key = self.rotary.apply(key_unrotated, positions)
+            if dtype is not None:
+                key = key.to(dtype)
             merged_layers.append((key.contiguous(), value.contiguous()))
 
         return tuple(merged_layers)
@@ -674,7 +677,7 @@ class SSDBlockKVStore:
         for key, value in entries:
             key_slice = key[:, :, start : start + length]
             value_slice = value[:, :, start : start + length]
-            key_unrotated = self.rotary.inverse(key_slice, positions)
+            key_unrotated = self.rotary.inverse(key_slice.float(), positions)
             block_layers.append(
                 (
                     _to_ssd_dtype(key_unrotated.detach().cpu(), self.config.dtype_on_ssd),
@@ -855,7 +858,7 @@ def _mean_last_key_query(
     entries = _cache_entries(past_key_values)
     if not entries:
         return torch.empty(0)
-    key = entries[0][0][:, :, -1:, :]
+    key = entries[0][0][:, :, -1:, :].float()
     if position is not None:
         key = rotary.inverse(key, torch.tensor([position], device=key.device, dtype=torch.long))
     return key[0, :, 0, :].float()
@@ -962,7 +965,7 @@ def _unrotated_tail_from_last_token(
 ) -> PastKeyValues:
     layers = []
     for key, value in _cache_entries(past_key_values):
-        key_last = key[:, :, -1:, :]
+        key_last = key[:, :, -1:, :].float()
         value_last = value[:, :, -1:, :]
         key_unrotated = rotary.inverse(
             key_last,
