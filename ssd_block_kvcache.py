@@ -35,6 +35,7 @@ class SSDBlockKVConfig:
     metadata_name: str = "metadata.pt"
     autosave_metadata: bool = False
     summary_centroids_per_block: int = 1
+    preserve_original_positions: bool = False
 
 
 @dataclass
@@ -134,6 +135,10 @@ def _model_layers(model) -> list:
             except TypeError:
                 return []
     return []
+
+
+def _uses_linear_attention(model) -> bool:
+    return any(hasattr(layer, "linear_attn") for layer in _model_layers(model))
 
 
 def _attention_layer_indices(model, attention_count: int) -> list[int]:
@@ -573,15 +578,24 @@ class SSDBlockKVStore:
         device: torch.device | str,
         dtype: torch.dtype | None = None,
         include_unrotated_tail: PastKeyValues | None = None,
+        include_unrotated_tail_start: int | None = None,
+        preserve_original_positions: bool | None = None,
     ) -> PastKeyValues:
         """Load selected blocks and replay them as a contiguous GPU KV cache.
 
         The selected SSD keys and optional tail keys are de-rotated internally.
-        This method assigns them new contiguous RoPE positions beginning at
-        `config.replay_position_base`, matching the "1..k" replay convention.
+        By default this method assigns them new contiguous RoPE positions
+        beginning at `config.replay_position_base`, matching the "1..k" replay
+        convention. `preserve_original_positions` keeps block token positions
+        unchanged, which is needed for hybrid attention models such as Qwen3.5.
         """
 
         self.stats.build_cache_calls += 1
+        preserve_original_positions = (
+            self.config.preserve_original_positions
+            if preserve_original_positions is None
+            else bool(preserve_original_positions)
+        )
         target_device = torch.device(device)
         selected = self._load_blocks_in_sequence_order(block_ids)
         tail_entries = _cache_entries(include_unrotated_tail)
@@ -595,14 +609,33 @@ class SSDBlockKVStore:
         for layer_idx in range(layer_count):
             key_parts = []
             value_parts = []
+            position_parts = []
             for block_layers, _meta in selected:
                 key_cpu, value_cpu = block_layers[layer_idx]
                 key_parts.append(key_cpu)
                 value_parts.append(value_cpu)
+                if preserve_original_positions:
+                    position_parts.append(
+                        torch.arange(
+                            _meta.token_start,
+                            _meta.token_start + int(key_cpu.shape[-2]),
+                            dtype=torch.long,
+                        )
+                    )
             if tail_entries:
                 tail_key, tail_value = tail_entries[layer_idx]
                 key_parts.append(tail_key.detach().cpu())
                 value_parts.append(tail_value.detach().cpu())
+                if preserve_original_positions:
+                    if include_unrotated_tail_start is None:
+                        raise ValueError("include_unrotated_tail_start is required when preserving positions")
+                    position_parts.append(
+                        torch.arange(
+                            int(include_unrotated_tail_start),
+                            int(include_unrotated_tail_start) + int(tail_key.shape[-2]),
+                            dtype=torch.long,
+                        )
+                    )
 
             key_unrotated = torch.cat(key_parts, dim=2).to(device=target_device)
             value = torch.cat(value_parts, dim=2).to(device=target_device)
@@ -611,12 +644,15 @@ class SSDBlockKVStore:
                 value = value.to(dtype)
 
             length = int(key_unrotated.shape[-2])
-            positions = torch.arange(
-                replay_cursor,
-                replay_cursor + length,
-                device=target_device,
-                dtype=torch.long,
-            )
+            if preserve_original_positions:
+                positions = torch.cat(position_parts, dim=0).to(device=target_device)
+            else:
+                positions = torch.arange(
+                    replay_cursor,
+                    replay_cursor + length,
+                    device=target_device,
+                    dtype=torch.long,
+                )
             key = self.rotary.apply(key_unrotated, positions)
             merged_layers.append((key.contiguous(), value.contiguous()))
 
@@ -1026,6 +1062,7 @@ def generate_with_ssd_block_kv(
     store = SSDBlockKVStore(ssd_dir, config, rotary, reset=True)
     store.add_past_key_values(past_key_values, token_start=0)
     linear_state_cache = _clone_linear_attention_cache(past_key_values, model=model)
+    preserve_positions = bool(config.preserve_original_positions or _uses_linear_attention(model))
 
     initial_query = _mean_last_key_query(
         past_key_values,
@@ -1066,13 +1103,21 @@ def generate_with_ssd_block_kv(
             break
 
         selection = store.select_blocks(query)
+        tail_len = _tail_length(decode_tail)
+        tail_start = prompt_len + len(generated) - 1 - tail_len if tail_len else None
         gpu_cache = store.build_past_key_values(
             selection.block_ids,
             device=device,
             dtype=model_dtype,
             include_unrotated_tail=decode_tail,
+            include_unrotated_tail_start=tail_start,
+            preserve_original_positions=preserve_positions,
         )
-        replay_position = config.replay_position_base + _cache_seq_len(gpu_cache)
+        replay_position = (
+            prompt_len + len(generated) - 1
+            if preserve_positions
+            else config.replay_position_base + _cache_seq_len(gpu_cache)
+        )
         with torch.inference_mode():
             out = _forward_with_cache(
                 model,
