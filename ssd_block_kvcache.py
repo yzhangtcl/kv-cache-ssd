@@ -1232,6 +1232,7 @@ def generate_with_ssd_block_kv(
                 )
             break
 
+        decode_select_started = time.perf_counter()
         selection = store.select_blocks(query)
         tail_len = _tail_length(decode_tail)
         tail_start = prompt_len + len(generated) - 1 - tail_len if tail_len else None
@@ -1243,6 +1244,7 @@ def generate_with_ssd_block_kv(
             include_unrotated_tail_start=tail_start,
             preserve_original_positions=preserve_positions,
         )
+        select_cache_sec = time.perf_counter() - decode_select_started
         if progress_callback is not None:
             progress_callback(
                 "decode_cache_built",
@@ -1255,6 +1257,7 @@ def generate_with_ssd_block_kv(
                     "cache_tokens": _cache_seq_len(gpu_cache),
                     "blocks_loaded_total": store.stats.blocks_loaded,
                     "tokens_loaded_total": store.stats.tokens_loaded,
+                    "select_cache_sec": round(select_cache_sec, 4),
                 },
             )
         replay_position = (
@@ -1262,6 +1265,7 @@ def generate_with_ssd_block_kv(
             if preserve_positions
             else config.replay_position_base + _cache_seq_len(gpu_cache)
         )
+        forward_started = time.perf_counter()
         with torch.inference_mode():
             out = _forward_with_cache(
                 model,
@@ -1270,6 +1274,8 @@ def generate_with_ssd_block_kv(
                 position_start=replay_position,
                 linear_state_cache=linear_state_cache,
             )
+        _cuda_synchronize_if_available()
+        forward_sec = time.perf_counter() - forward_started
         linear_state_cache = _clone_linear_attention_cache(out.past_key_values, model=model)
         if progress_callback is not None:
             progress_callback(
@@ -1278,6 +1284,7 @@ def generate_with_ssd_block_kv(
                     "step": step + 1,
                     "generated_tokens": len(generated),
                     "replay_position": replay_position,
+                    "forward_sec": round(forward_sec, 4),
                 },
             )
 

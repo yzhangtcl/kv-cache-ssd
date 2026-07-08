@@ -240,10 +240,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-file", default="outputs/longmemeval_s_ssd_predictions.jsonl")
     parser.add_argument("--eval-log", default=None)
     parser.add_argument("--progress-log", default=None, help="Optional jsonl file for per-question progress events.")
+    parser.add_argument("--progress-every", type=int, default=10, help="Log decode progress every N tokens.")
     parser.add_argument("--limit", type=int, default=0, help="0 means all examples.")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=64)
-    parser.add_argument("--prefill-chunk-tokens", type=int, default=1024)
+    parser.add_argument("--prefill-chunk-tokens", type=int, default=8192)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--top-k-blocks", type=int, default=1024)
     parser.add_argument("--summary-centroids-per-block", type=int, default=4)
@@ -334,6 +335,11 @@ def main() -> None:
             thinking = None if args.enable_thinking == "auto" else args.enable_thinking == "1"
 
             def generation_progress(event: str, payload: dict[str, Any]) -> None:
+                if event in {"decode_cache_built", "decode_forward_done"}:
+                    step = int(payload.get("step", 0) or 0)
+                    every = max(1, int(args.progress_every))
+                    if step > 1 and step % every != 0:
+                        return
                 log_progress(
                     event,
                     {
