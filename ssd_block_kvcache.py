@@ -125,43 +125,98 @@ def _dynamic_cache_cls():
     return None
 
 
-def _legacy_tuple_to_dynamic_cache(past_key_values: PastKeyValues):
+def _model_layers(model) -> list:
+    for path in ("model.layers", "transformer.h", "gpt_neox.layers"):
+        layers = _find_attr(model, path)
+        if layers is not None:
+            try:
+                return list(layers)
+            except TypeError:
+                return []
+    return []
+
+
+def _attention_layer_indices(model, attention_count: int) -> list[int]:
+    layers = _model_layers(model)
+    if layers:
+        indices = [
+            idx
+            for idx, layer in enumerate(layers)
+            if hasattr(layer, "self_attn") or not hasattr(layer, "linear_attn")
+        ]
+        if len(indices) == int(attention_count):
+            return indices
+
+    config = getattr(model, "config", None)
+    for attr in ("layer_types", "layers_block_type", "attention_layer_types"):
+        values = getattr(config, attr, None)
+        if values is None:
+            continue
+        indices = [
+            idx
+            for idx, value in enumerate(values)
+            if "linear" not in str(value).lower()
+        ]
+        if len(indices) == int(attention_count):
+            return indices
+
+    return list(range(int(attention_count)))
+
+
+def _new_dynamic_cache(cls, model=None):
+    config = getattr(model, "config", None)
+    if config is not None:
+        for kwargs in ({"config": config}, {"model_config": config}):
+            try:
+                return cls(**kwargs)
+            except TypeError:
+                pass
+            except Exception:
+                pass
+    try:
+        return cls()
+    except TypeError:
+        try:
+            return cls(config=None)
+        except Exception:
+            return None
+
+
+def _legacy_tuple_to_dynamic_cache(past_key_values: PastKeyValues, model=None):
     cls = _dynamic_cache_cls()
     if cls is None:
         return past_key_values
 
-    from_legacy = getattr(cls, "from_legacy_cache", None)
-    if from_legacy is not None:
-        try:
-            return from_legacy(past_key_values)
-        except Exception:
-            pass
+    if model is None:
+        from_legacy = getattr(cls, "from_legacy_cache", None)
+        if from_legacy is not None:
+            try:
+                return from_legacy(past_key_values)
+            except Exception:
+                pass
 
-    try:
-        cache = cls()
-    except TypeError:
-        try:
-            cache = cls(config=None)
-        except Exception:
-            return past_key_values
+    cache = _new_dynamic_cache(cls, model=model)
+    if cache is None:
+        return past_key_values
 
     update = getattr(cache, "update", None)
     if update is None:
         return past_key_values
 
     try:
-        for layer_idx, (key, value) in enumerate(past_key_values):
+        layer_indices = _attention_layer_indices(model, len(past_key_values)) if model is not None else range(len(past_key_values))
+        for layer_idx, (key, value) in zip(layer_indices, past_key_values):
             update(key, value, layer_idx)
         return cache
     except Exception:
         return past_key_values
 
 
-def _to_model_cache(past_key_values):
+def _to_model_cache(past_key_values, model=None):
     if past_key_values is None or hasattr(past_key_values, "get_seq_length"):
         return past_key_values
     if isinstance(past_key_values, tuple):
-        return _legacy_tuple_to_dynamic_cache(past_key_values)
+        return _legacy_tuple_to_dynamic_cache(past_key_values, model=model)
     return past_key_values
 
 
@@ -731,7 +786,7 @@ def _forward_with_cache(
     position_start: int,
 ):
     past_len = _cache_seq_len(past_key_values)
-    model_cache = _to_model_cache(past_key_values)
+    model_cache = _to_model_cache(past_key_values, model=model)
     if isinstance(model_cache, tuple):
         model_type = getattr(getattr(model, "config", None), "model_type", "")
         if "qwen3_5" in str(model_type).lower():
