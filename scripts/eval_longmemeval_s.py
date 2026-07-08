@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import time
 import urllib.error
 import urllib.request
@@ -111,10 +112,13 @@ def build_prompt(entry: dict[str, Any], *, history_format: str, user_only: bool)
     return (
         "You are given timestamped chat history between a user and an assistant. "
         "Answer the final question using only the information in the history. "
-        "This is an extraction task: if the history contains a relevant fact, return the complete answer exactly "
-        "and do not hedge. Do not explain your reasoning. Do not output a partial phrase if a fuller name, title, "
-        "duration, date, or quantity is available. If the history truly does not contain the requested information, "
-        "say only: Not available.\n\n"
+        "This is a short extraction task. Return only the minimal complete answer span, not a sentence, unless "
+        "a sentence is the only natural answer. Do not explain your reasoning. Do not include role names, JSON, "
+        "XML tags, thinking text, or repeated answers. Do not output a partial phrase if a fuller name, title, "
+        "duration, date, quantity, color description, location, organization, or event name is available. "
+        "If the user asks where, what place, which store, which class, which shade, or which event, answer only "
+        "that exact requested item. If the history contains a relevant fact, answer it directly and do not hedge. "
+        "If the history truly does not contain the requested information, say only: Not available.\n\n"
         f"Question date: {question_date}\n\n"
         "Chat history:\n"
         f"{history}\n\n"
@@ -239,6 +243,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-file", default="data/longmemeval_s_cleaned.json")
     parser.add_argument("--model-dir", default=os.environ.get("MODEL_DIR", "/root/blockdata/data/models/qwen3.5-9b"))
     parser.add_argument("--ssd-dir", default=os.environ.get("SSD_DIR", "/root/blockdata/data/kvssd-longmemeval"))
+    parser.add_argument("--cleanup-ssd-cache", action="store_true", help="Delete each question's SSD KV cache after it finishes.")
     parser.add_argument("--out-file", default="outputs/longmemeval_s_ssd_predictions.jsonl")
     parser.add_argument("--eval-log", default=None)
     parser.add_argument("--progress-log", default=None, help="Optional jsonl file for per-question progress events.")
@@ -306,6 +311,7 @@ def main() -> None:
     judged = 0
     for idx, entry in enumerate(subset, start=args.start):
         qid = str(entry["question_id"])
+        question_ssd_dir = Path(args.ssd_dir) / _safe_name(qid)
         hypothesis = None
         log_progress(
             "question_start",
@@ -333,7 +339,6 @@ def main() -> None:
                     "sessions": len(entry.get("haystack_sessions") or []),
                 },
             )
-            ssd_dir = Path(args.ssd_dir) / _safe_name(qid)
             thinking = None if args.enable_thinking == "auto" else args.enable_thinking == "1"
 
             def generation_progress(event: str, payload: dict[str, Any]) -> None:
@@ -355,7 +360,7 @@ def main() -> None:
                 model,
                 tokenizer,
                 prompt,
-                ssd_dir=ssd_dir,
+                ssd_dir=question_ssd_dir,
                 max_new_tokens=args.max_new_tokens,
                 prefill_chunk_tokens=args.prefill_chunk_tokens,
                 config=SSDBlockKVConfig(
@@ -434,6 +439,16 @@ def main() -> None:
                 "running_judged": judged,
             },
         )
+        if args.cleanup_ssd_cache and question_ssd_dir.exists():
+            shutil.rmtree(question_ssd_dir)
+            log_progress(
+                "ssd_cache_cleaned",
+                {
+                    "index": idx,
+                    "question_id": qid,
+                    "path": str(question_ssd_dir),
+                },
+            )
 
     print(f"predictions: {out_file}")
     if args.judge:
