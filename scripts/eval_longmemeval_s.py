@@ -12,6 +12,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+
 def _json_load(path: Path) -> list[dict[str, Any]]:
     text = path.read_text(encoding="utf-8")
     try:
@@ -45,6 +46,23 @@ def _load_jsonl_by_qid(path: Path) -> dict[str, dict[str, Any]]:
 
 def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:160] or "sample"
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _make_progress_logger(path: Path | None):
+    def log(event: str, payload: dict[str, Any]) -> None:
+        record = {"time": _now(), "event": event, **payload}
+        text = json.dumps(record, ensure_ascii=False)
+        print(text, flush=True)
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                print(text, file=f)
+
+    return log
 
 
 def _format_session(session: list[dict[str, Any]], *, user_only: bool) -> str:
@@ -221,6 +239,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ssd-dir", default=os.environ.get("SSD_DIR", "/root/blockdata/data/kvssd-longmemeval"))
     parser.add_argument("--out-file", default="outputs/longmemeval_s_ssd_predictions.jsonl")
     parser.add_argument("--eval-log", default=None)
+    parser.add_argument("--progress-log", default=None, help="Optional jsonl file for per-question progress events.")
     parser.add_argument("--limit", type=int, default=0, help="0 means all examples.")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=64)
@@ -247,6 +266,8 @@ def main() -> None:
     data_file = Path(args.data_file)
     out_file = Path(args.out_file)
     eval_log = Path(args.eval_log) if args.eval_log else Path(str(out_file) + ".deepseek.log")
+    progress_log = Path(args.progress_log) if args.progress_log else None
+    log_progress = _make_progress_logger(progress_log)
     data = _json_load(data_file)
     subset = data[args.start :]
     if args.limit > 0:
@@ -283,14 +304,45 @@ def main() -> None:
     for idx, entry in enumerate(subset, start=args.start):
         qid = str(entry["question_id"])
         hypothesis = None
+        log_progress(
+            "question_start",
+            {
+                "index": idx,
+                "question_id": qid,
+                "question_type": entry.get("question_type"),
+                "question": entry.get("question"),
+            },
+        )
         if qid in predictions:
             hypothesis = str(predictions[qid].get("hypothesis", ""))
             print(f"[{idx}] skip generated {qid}")
         elif not args.judge_existing:
             assert model is not None and tokenizer is not None
             prompt = build_prompt(entry, history_format=args.history_format, user_only=args.user_only)
+            prompt_tokens = len(tokenizer(prompt, add_special_tokens=True)["input_ids"])
+            log_progress(
+                "prompt_built",
+                {
+                    "index": idx,
+                    "question_id": qid,
+                    "prompt_chars": len(prompt),
+                    "prompt_tokens_before_chat_template": prompt_tokens,
+                    "sessions": len(entry.get("haystack_sessions") or []),
+                },
+            )
             ssd_dir = Path(args.ssd_dir) / _safe_name(qid)
             thinking = None if args.enable_thinking == "auto" else args.enable_thinking == "1"
+
+            def generation_progress(event: str, payload: dict[str, Any]) -> None:
+                log_progress(
+                    event,
+                    {
+                        "index": idx,
+                        "question_id": qid,
+                        **payload,
+                    },
+                )
+
             result = generate_with_ssd_block_kv(
                 model,
                 tokenizer,
@@ -306,16 +358,31 @@ def main() -> None:
                 ),
                 use_chat_template=not args.no_chat_template,
                 chat_template_enable_thinking=thinking,
+                progress_callback=generation_progress,
             )
             hypothesis = result.text.strip()
             _append_jsonl(out_file, {"question_id": qid, "hypothesis": hypothesis})
             predictions[qid] = {"question_id": qid, "hypothesis": hypothesis}
+            log_progress(
+                "question_generated",
+                {
+                    "index": idx,
+                    "question_id": qid,
+                    "generated_tokens": result.generated_tokens,
+                    "elapsed_sec": round(result.elapsed_sec, 3),
+                    "peak_memory_gb": round(result.peak_memory_gb, 3),
+                    "blocks_written": result.ssd_cache.blocks_written,
+                    "tokens_loaded": result.ssd_cache.tokens_loaded,
+                    "output_chars": len(hypothesis),
+                },
+            )
             print(
                 f"[{idx}] generated {qid} tokens={result.generated_tokens} "
                 f"sec={result.elapsed_sec:.2f} blocks={result.ssd_cache.blocks_written}"
             )
 
         if args.judge and qid not in evals and hypothesis is not None:
+            log_progress("judge_start", {"index": idx, "question_id": qid})
             label = judge_with_deepseek(
                 entry,
                 hypothesis,
@@ -334,12 +401,31 @@ def main() -> None:
             }
             _append_jsonl(eval_log, log_entry)
             evals[qid] = log_entry
+            log_progress(
+                "judge_done",
+                {
+                    "index": idx,
+                    "question_id": qid,
+                    "label": label["label"],
+                    "raw_response": label["raw_response"],
+                },
+            )
             print(f"[{idx}] judged {qid}: {label['label']} ({label['raw_response']})")
 
         if qid in evals:
             judged += 1
             if bool(evals[qid].get("autoeval_label", {}).get("label")):
                 correct += 1
+        log_progress(
+            "question_done",
+            {
+                "index": idx,
+                "question_id": qid,
+                "judged": qid in evals,
+                "running_correct": correct,
+                "running_judged": judged,
+            },
+        )
 
     print(f"predictions: {out_file}")
     if args.judge:

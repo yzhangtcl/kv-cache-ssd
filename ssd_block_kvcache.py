@@ -1085,6 +1085,7 @@ def generate_with_ssd_block_kv(
     use_chat_template: bool = False,
     chat_template_enable_thinking: bool | None = None,
     stream_callback=None,
+    progress_callback=None,
 ) -> GenerationResult:
     """Baseline generation path using SSD block retrieval.
 
@@ -1122,11 +1123,23 @@ def generate_with_ssd_block_kv(
     started = time.perf_counter()
 
     prompt_len = int(input_ids.shape[1])
+    if progress_callback is not None:
+        progress_callback(
+            "prefill_start",
+            {
+                "prompt_tokens": prompt_len,
+                "prefill_chunk_tokens": int(prefill_chunk_tokens),
+            },
+        )
     past_key_values = None
     logits = None
     cursor = 0
+    prefill_chunk_idx = 0
     while cursor < prompt_len:
         chunk = input_ids[:, cursor : cursor + prefill_chunk_tokens]
+        prefill_chunk_idx += 1
+        chunk_start = cursor
+        chunk_tokens = int(chunk.shape[1])
         with torch.inference_mode():
             out = _forward_with_cache(
                 model,
@@ -1136,7 +1149,19 @@ def generate_with_ssd_block_kv(
             )
         past_key_values = out.past_key_values
         logits = out.logits
-        cursor += int(chunk.shape[1])
+        cursor += chunk_tokens
+        if progress_callback is not None:
+            progress_callback(
+                "prefill_chunk",
+                {
+                    "chunk_index": prefill_chunk_idx,
+                    "chunk_start": chunk_start,
+                    "chunk_tokens": chunk_tokens,
+                    "done_tokens": cursor,
+                    "prompt_tokens": prompt_len,
+                    "cache_tokens": _cache_seq_len(past_key_values),
+                },
+            )
 
     entries = _cache_entries(past_key_values)
     if not entries:
@@ -1146,6 +1171,15 @@ def generate_with_ssd_block_kv(
     rotary = RotaryEmbeddingAdapter.from_model(model, head_dim=head_dim)
     store = SSDBlockKVStore(ssd_dir, config, rotary, reset=True)
     store.add_past_key_values(past_key_values, token_start=0)
+    if progress_callback is not None:
+        progress_callback(
+            "prefill_written_to_ssd",
+            {
+                "blocks_written": store.stats.blocks_written,
+                "tokens_written": store.stats.tokens_written,
+                "bytes_written": store.stats.bytes_written,
+            },
+        )
     linear_state_cache = _clone_linear_attention_cache(past_key_values, model=model)
     preserve_positions = bool(config.preserve_original_positions or _uses_linear_attention(model))
 
@@ -1173,8 +1207,10 @@ def generate_with_ssd_block_kv(
     streamed_text = ""
     decode_tail: PastKeyValues | None = None
     query = initial_query
+    if progress_callback is not None:
+        progress_callback("decode_start", {"max_new_tokens": int(max_new_tokens)})
 
-    for _ in range(max_new_tokens):
+    for step in range(max_new_tokens):
         token_id = int(next_token.item())
         generated.append(token_id)
         penalty_token_ids.add(token_id)
@@ -1185,6 +1221,15 @@ def generate_with_ssd_block_kv(
                 stream_callback(delta)
             streamed_text = text
         if token_id in eos_ids:
+            if progress_callback is not None:
+                progress_callback(
+                    "decode_eos",
+                    {
+                        "step": step + 1,
+                        "token_id": token_id,
+                        "generated_tokens": len(generated),
+                    },
+                )
             break
 
         selection = store.select_blocks(query)
@@ -1198,6 +1243,20 @@ def generate_with_ssd_block_kv(
             include_unrotated_tail_start=tail_start,
             preserve_original_positions=preserve_positions,
         )
+        if progress_callback is not None:
+            progress_callback(
+                "decode_cache_built",
+                {
+                    "step": step + 1,
+                    "token_id": token_id,
+                    "generated_tokens": len(generated),
+                    "selected_blocks": len(selection.block_ids),
+                    "tail_tokens": tail_len,
+                    "cache_tokens": _cache_seq_len(gpu_cache),
+                    "blocks_loaded_total": store.stats.blocks_loaded,
+                    "tokens_loaded_total": store.stats.tokens_loaded,
+                },
+            )
         replay_position = (
             prompt_len + len(generated) - 1
             if preserve_positions
@@ -1212,6 +1271,15 @@ def generate_with_ssd_block_kv(
                 linear_state_cache=linear_state_cache,
             )
         linear_state_cache = _clone_linear_attention_cache(out.past_key_values, model=model)
+        if progress_callback is not None:
+            progress_callback(
+                "decode_forward_done",
+                {
+                    "step": step + 1,
+                    "generated_tokens": len(generated),
+                    "replay_position": replay_position,
+                },
+            )
 
         new_tail = _unrotated_tail_from_last_token(
             out.past_key_values,
@@ -1221,6 +1289,15 @@ def generate_with_ssd_block_kv(
         decode_tail = _append_tail(decode_tail, new_tail)
         if _tail_length(decode_tail) >= config.block_size:
             store.add_unrotated_layers(decode_tail, token_start=prompt_len + len(generated) - _tail_length(decode_tail))
+            if progress_callback is not None:
+                progress_callback(
+                    "decode_tail_written_to_ssd",
+                    {
+                        "step": step + 1,
+                        "blocks_written": store.stats.blocks_written,
+                        "tokens_written": store.stats.tokens_written,
+                    },
+                )
             decode_tail = None
 
         query = _mean_last_key_query(
@@ -1242,6 +1319,15 @@ def generate_with_ssd_block_kv(
             decode_tail,
             token_start=prompt_len + len(generated) - _tail_length(decode_tail),
         )
+        if progress_callback is not None:
+            progress_callback(
+                "decode_tail_written_to_ssd",
+                {
+                    "step": len(generated),
+                    "blocks_written": store.stats.blocks_written,
+                    "tokens_written": store.stats.tokens_written,
+                },
+            )
     store.save_metadata()
 
     _cuda_synchronize_if_available()
