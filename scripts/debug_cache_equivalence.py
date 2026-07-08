@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import os
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from ssd_block_kvcache import (
+    RotaryEmbeddingAdapter,
+    SSDBlockKVConfig,
+    SSDBlockKVStore,
+    _cache_entries,
+    _clone_linear_attention_cache,
+    _forward_with_cache,
+    _mean_last_key_query,
+)
+
+
+def _render_prompt(tokenizer, prompt: str) -> str:
+    if os.environ.get("USE_CHAT_TEMPLATE", "1") != "1":
+        return prompt
+    if not hasattr(tokenizer, "apply_chat_template"):
+        return prompt
+    kwargs = {"add_generation_prompt": True, "tokenize": False}
+    if os.environ.get("ENABLE_THINKING") is not None:
+        kwargs["enable_thinking"] = os.environ.get("ENABLE_THINKING") == "1"
+    try:
+        return tokenizer.apply_chat_template([{"role": "user", "content": prompt}], **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        return tokenizer.apply_chat_template([{"role": "user", "content": prompt}], **kwargs)
+
+
+def _top_tokens(tokenizer, logits: torch.Tensor, k: int = 5) -> list[tuple[int, str, float]]:
+    values, indices = torch.topk(logits[0, -1].float(), k=k)
+    out = []
+    for token_id, value in zip(indices.tolist(), values.tolist()):
+        out.append((int(token_id), tokenizer.decode([int(token_id)]), float(value)))
+    return out
+
+
+def main() -> None:
+    model_path = os.environ.get("MODEL_DIR", "/root/blockdata/data/models/qwen3.5-9b")
+    ssd_dir = os.environ.get("SSD_DIR", "/root/blockdata/data/kvssd-debug")
+    prompt = os.environ.get("PROMPT", "请用三句话解释 KV cache 为什么影响长上下文推理速度。")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype="auto",
+        device_map="cuda:0",
+        trust_remote_code=True,
+        attn_implementation="sdpa",
+    )
+    model.eval()
+
+    rendered = _render_prompt(tokenizer, prompt)
+    input_ids = tokenizer(rendered, return_tensors="pt", add_special_tokens=False)["input_ids"].to("cuda")
+    prompt_len = int(input_ids.shape[-1])
+    print("model_path:", model_path)
+    print("prompt_tokens:", prompt_len)
+
+    with torch.inference_mode():
+        prefill = _forward_with_cache(model, input_ids, past_key_values=None, position_start=0)
+
+    prefill_entries = _cache_entries(prefill.past_key_values)
+    print("attention_kv_layers:", len(prefill_entries))
+    print("prefill_top5:", _top_tokens(tokenizer, prefill.logits))
+
+    next_token = torch.argmax(prefill.logits[:, -1, :], dim=-1, keepdim=True)
+    print("chosen_next:", int(next_token.item()), tokenizer.decode([int(next_token.item())]))
+
+    head_dim = int(prefill_entries[0][0].shape[-1])
+    model_dtype = prefill_entries[0][0].dtype
+    rotary = RotaryEmbeddingAdapter.from_model(model, head_dim=head_dim)
+    store = SSDBlockKVStore(
+        ssd_dir,
+        SSDBlockKVConfig(
+            block_size=256,
+            top_k_blocks=1000,
+            summary_centroids_per_block=4,
+            preserve_original_positions=True,
+        ),
+        rotary,
+        reset=True,
+    )
+    store.add_past_key_values(prefill.past_key_values, token_start=0)
+    query = _mean_last_key_query(prefill.past_key_values, rotary, position=prompt_len - 1)
+    selection = store.select_blocks(query)
+    print("selected_blocks:", selection.block_ids)
+    print("selected_scores:", selection.scores)
+
+    replay_cache = store.build_past_key_values(
+        selection.block_ids,
+        device="cuda",
+        dtype=model_dtype,
+        preserve_original_positions=True,
+    )
+    replay_entries = _cache_entries(replay_cache)
+    print("replay_kv_layers:", len(replay_entries))
+    if prefill_entries and replay_entries:
+        key_diff = (prefill_entries[0][0] - replay_entries[0][0]).float().abs().max().item()
+        value_diff = (prefill_entries[0][1] - replay_entries[0][1]).float().abs().max().item()
+        print("layer0_key_max_abs_diff:", key_diff)
+        print("layer0_value_max_abs_diff:", value_diff)
+
+    linear_state_cache = _clone_linear_attention_cache(prefill.past_key_values, model=model)
+    with torch.inference_mode():
+        ref = _forward_with_cache(
+            model,
+            next_token,
+            past_key_values=prefill.past_key_values,
+            position_start=prompt_len,
+        )
+        ssd = _forward_with_cache(
+            model,
+            next_token,
+            past_key_values=replay_cache,
+            position_start=prompt_len,
+            linear_state_cache=linear_state_cache,
+        )
+
+    diff = (ref.logits[:, -1, :].float() - ssd.logits[:, -1, :].float()).abs()
+    print("next_step_logits_max_abs_diff:", diff.max().item())
+    print("next_step_logits_mean_abs_diff:", diff.mean().item())
+    print("ref_top5:", _top_tokens(tokenizer, ref.logits))
+    print("ssd_top5:", _top_tokens(tokenizer, ssd.logits))
+
+
+if __name__ == "__main__":
+    main()
