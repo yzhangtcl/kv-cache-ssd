@@ -11,6 +11,11 @@ from typing import Iterable, Sequence
 
 import torch
 
+try:
+    from transformers.cache_utils import DynamicCache
+except Exception:  # pragma: no cover - optional Transformers compatibility shim
+    DynamicCache = None
+
 
 PastKeyValues = tuple[tuple[torch.Tensor, torch.Tensor], ...]
 
@@ -110,6 +115,16 @@ def _cache_seq_len(past_key_values) -> int:
     if not entries:
         return 0
     return int(entries[0][0].shape[-2])
+
+
+def _to_model_cache(past_key_values):
+    if past_key_values is None or hasattr(past_key_values, "get_seq_length"):
+        return past_key_values
+    if isinstance(past_key_values, tuple) and DynamicCache is not None:
+        from_legacy = getattr(DynamicCache, "from_legacy_cache", None)
+        if from_legacy is not None:
+            return from_legacy(past_key_values)
+    return past_key_values
 
 
 def _position_ids(start: int, length: int, device: torch.device) -> torch.Tensor:
@@ -688,7 +703,7 @@ def _forward_with_cache(
         "attention_mask": attention_mask,
         "position_ids": _position_ids(position_start, int(input_ids.shape[1]), input_ids.device),
         "cache_position": _cache_position(past_len, int(input_ids.shape[1]), input_ids.device),
-        "past_key_values": past_key_values,
+        "past_key_values": _to_model_cache(past_key_values),
         "use_cache": True,
     }
     try:
