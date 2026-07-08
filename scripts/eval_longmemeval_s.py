@@ -111,13 +111,15 @@ def build_prompt(entry: dict[str, Any], *, history_format: str, user_only: bool)
     return (
         "You are given timestamped chat history between a user and an assistant. "
         "Answer the final question using only the information in the history. "
-        "Return a concise answer. If the question cannot be answered from the history, "
-        "say that the information is not available.\n\n"
+        "This is an extraction task: if the history contains a relevant fact, return the complete answer exactly "
+        "and do not hedge. Do not explain your reasoning. Do not output a partial phrase if a fuller name, title, "
+        "duration, date, or quantity is available. If the history truly does not contain the requested information, "
+        "say only: Not available.\n\n"
         f"Question date: {question_date}\n\n"
         "Chat history:\n"
         f"{history}\n\n"
         f"Question: {question}\n\n"
-        "Answer:"
+        "Complete answer only:"
     )
 
 
