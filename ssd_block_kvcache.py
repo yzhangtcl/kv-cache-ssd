@@ -31,7 +31,7 @@ class SSDBlockKVConfig:
     top_k_blocks: int = 1000
     summary_layer: int = 0
     replay_position_base: int = 1
-    dtype_on_ssd: torch.dtype = torch.float16
+    dtype_on_ssd: torch.dtype | None = None
     metadata_name: str = "metadata.pt"
     autosave_metadata: bool = False
     summary_centroids_per_block: int = 1
@@ -101,6 +101,10 @@ def _cache_entries(past_key_values) -> list[tuple[torch.Tensor, torch.Tensor]]:
         return entries
     except TypeError:
         return []
+
+
+def _to_ssd_dtype(tensor: torch.Tensor, dtype: torch.dtype | None) -> torch.Tensor:
+    return tensor if dtype is None else tensor.to(dtype)
 
 
 def _cache_seq_len(past_key_values) -> int:
@@ -532,8 +536,8 @@ class SSDBlockKVStore:
             for key, value in entries:
                 block_layers.append(
                     (
-                        key[:, :, cursor : cursor + take].detach().cpu().to(self.config.dtype_on_ssd),
-                        value[:, :, cursor : cursor + take].detach().cpu().to(self.config.dtype_on_ssd),
+                        _to_ssd_dtype(key[:, :, cursor : cursor + take].detach().cpu(), self.config.dtype_on_ssd),
+                        _to_ssd_dtype(value[:, :, cursor : cursor + take].detach().cpu(), self.config.dtype_on_ssd),
                     )
                 )
             self._write_unrotated_block(tuple(block_layers), token_start + cursor)
@@ -673,8 +677,8 @@ class SSDBlockKVStore:
             key_unrotated = self.rotary.inverse(key_slice, positions)
             block_layers.append(
                 (
-                    key_unrotated.detach().cpu().to(self.config.dtype_on_ssd),
-                    value_slice.detach().cpu().to(self.config.dtype_on_ssd),
+                    _to_ssd_dtype(key_unrotated.detach().cpu(), self.config.dtype_on_ssd),
+                    _to_ssd_dtype(value_slice.detach().cpu(), self.config.dtype_on_ssd),
                 )
             )
         self._write_unrotated_block(tuple(block_layers), int(positions[0].item()))
@@ -741,7 +745,11 @@ class SSDBlockKVStore:
         payload = {
             "config": {
                 **asdict(self.config),
-                "dtype_on_ssd": str(self.config.dtype_on_ssd).replace("torch.", ""),
+                "dtype_on_ssd": (
+                    None
+                    if self.config.dtype_on_ssd is None
+                    else str(self.config.dtype_on_ssd).replace("torch.", "")
+                ),
             },
             "metas": [asdict(meta) for meta in self._metas],
             "summaries": self._summaries,
