@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
+import copy
 from dataclasses import asdict, dataclass
 from importlib import import_module
 from pathlib import Path
@@ -203,17 +204,86 @@ def _cache_layers(past_key_values) -> list:
         return []
 
 
+def _clone_cache_attr(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, tuple):
+        return tuple(_clone_cache_attr(item) for item in value)
+    if isinstance(value, list):
+        return [_clone_cache_attr(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _clone_cache_attr(item) for key, item in value.items()}
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
+
+
+def _copy_cache_root_state(target_cache, source_cache) -> None:
+    source_dict = getattr(source_cache, "__dict__", {})
+    for name, value in source_dict.items():
+        if name in {"layers", "key_cache", "value_cache"}:
+            continue
+        try:
+            setattr(target_cache, name, _clone_cache_attr(value))
+        except Exception:
+            pass
+
+
+def _copy_cache_layer_state(target_layer, source_layer, *, include_attention_kv: bool) -> None:
+    source_dict = getattr(source_layer, "__dict__", {})
+    skip = set() if include_attention_kv else {"keys", "values", "key_cache", "value_cache"}
+    for name, value in source_dict.items():
+        if name in skip:
+            continue
+        try:
+            setattr(target_layer, name, _clone_cache_attr(value))
+        except Exception:
+            pass
+
+
+def _layer_has_attention_kv(layer) -> bool:
+    key = getattr(layer, "keys", None)
+    value = getattr(layer, "values", None)
+    return isinstance(key, torch.Tensor) and isinstance(value, torch.Tensor)
+
+
 def _copy_linear_attention_state(target_cache, source_cache) -> None:
+    _copy_cache_root_state(target_cache, source_cache)
     target_layers = _cache_layers(target_cache)
     source_layers = _cache_layers(source_cache)
     if not target_layers or not source_layers:
         return
 
     for target_layer, source_layer in zip(target_layers, source_layers):
-        for attr in ("conv_states", "recurrent_states"):
-            value = getattr(source_layer, attr, None)
-            if isinstance(value, torch.Tensor):
-                setattr(target_layer, attr, value.detach().clone())
+        if _layer_has_attention_kv(source_layer):
+            continue
+        _copy_cache_layer_state(target_layer, source_layer, include_attention_kv=False)
+
+
+def _set_attention_entries(cache, past_key_values: PastKeyValues, model=None) -> bool:
+    layers = _cache_layers(cache)
+    if not layers:
+        return False
+
+    layer_indices = (
+        _attention_layer_indices(model, len(past_key_values))
+        if model is not None
+        else list(range(len(past_key_values)))
+    )
+    if len(layer_indices) != len(past_key_values):
+        return False
+
+    for layer_idx, (key, value) in zip(layer_indices, past_key_values):
+        if layer_idx >= len(layers):
+            return False
+        layer = layers[layer_idx]
+        try:
+            setattr(layer, "keys", key)
+            setattr(layer, "values", value)
+        except Exception:
+            return False
+    return True
 
 
 def _clone_linear_attention_cache(past_key_values, model=None):
@@ -229,12 +299,12 @@ def _clone_linear_attention_cache(past_key_values, model=None):
     return cache
 
 
-def _legacy_tuple_to_dynamic_cache(past_key_values: PastKeyValues, model=None):
+def _legacy_tuple_to_dynamic_cache(past_key_values: PastKeyValues, model=None, template_cache=None):
     cls = _dynamic_cache_cls()
     if cls is None:
         return past_key_values
 
-    if model is None:
+    if model is None and template_cache is None:
         from_legacy = getattr(cls, "from_legacy_cache", None)
         if from_legacy is not None:
             try:
@@ -246,9 +316,12 @@ def _legacy_tuple_to_dynamic_cache(past_key_values: PastKeyValues, model=None):
     if cache is None:
         return past_key_values
 
+    if template_cache is not None:
+        _copy_linear_attention_state(cache, template_cache)
+
     update = getattr(cache, "update", None)
     if update is None:
-        return past_key_values
+        return cache if _set_attention_entries(cache, past_key_values, model=model) else past_key_values
 
     try:
         layer_indices = _attention_layer_indices(model, len(past_key_values)) if model is not None else range(len(past_key_values))
@@ -256,17 +329,18 @@ def _legacy_tuple_to_dynamic_cache(past_key_values: PastKeyValues, model=None):
             update(key, value, layer_idx)
         return cache
     except Exception:
-        return past_key_values
+        return cache if _set_attention_entries(cache, past_key_values, model=model) else past_key_values
 
 
 def _to_model_cache(past_key_values, model=None, linear_state_cache=None):
     if past_key_values is None or hasattr(past_key_values, "get_seq_length"):
         return past_key_values
     if isinstance(past_key_values, tuple):
-        cache = _legacy_tuple_to_dynamic_cache(past_key_values, model=model)
-        if cache is not past_key_values and linear_state_cache is not None:
-            _copy_linear_attention_state(cache, linear_state_cache)
-        return cache
+        return _legacy_tuple_to_dynamic_cache(
+            past_key_values,
+            model=model,
+            template_cache=linear_state_cache,
+        )
     return past_key_values
 
 

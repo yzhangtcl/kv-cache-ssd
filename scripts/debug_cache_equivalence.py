@@ -55,6 +55,15 @@ def _cache_attention_layer_indices(past_key_values) -> list[int]:
     return out
 
 
+def _has_previous_state(past_key_values) -> str:
+    if not hasattr(past_key_values, "has_previous_state"):
+        return "<missing>"
+    try:
+        return str(bool(past_key_values.has_previous_state()))
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
 def main() -> None:
     model_path = os.environ.get("MODEL_DIR", "/root/blockdata/data/models/qwen3.5-9b")
     ssd_dir = os.environ.get("SSD_DIR", "/root/blockdata/data/kvssd-debug")
@@ -83,6 +92,7 @@ def main() -> None:
     print("attention_kv_layers:", len(prefill_entries))
     print("inferred_attention_layer_indices:", _attention_layer_indices(model, len(prefill_entries)))
     print("cache_attention_layer_indices:", _cache_attention_layer_indices(prefill.past_key_values))
+    print("prefill_has_previous_state:", _has_previous_state(prefill.past_key_values))
     print("prefill_top5:", _top_tokens(tokenizer, prefill.logits))
 
     next_token = torch.argmax(prefill.logits[:, -1, :], dim=-1, keepdim=True)
@@ -137,6 +147,7 @@ def main() -> None:
     )
 
     linear_state_cache = _clone_linear_attention_cache(prefill.past_key_values, model=model)
+    print("linear_state_cache_has_previous_state:", _has_previous_state(linear_state_cache))
     with torch.inference_mode():
         ref = _forward_with_cache(
             model,
