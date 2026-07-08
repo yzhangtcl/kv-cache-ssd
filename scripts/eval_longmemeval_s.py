@@ -134,8 +134,17 @@ def get_anscheck_prompt(
     response: str,
     *,
     abstention: bool,
+    lenient: bool,
 ) -> str:
     verdict_line = "Reply with exactly one word: yes or no."
+    lenient_rule = (
+        "Use a lenient short-answer criterion: answer yes if the response captures the main requested "
+        "entity, value, date, duration, quantity, place, color, person, organization, or event from the "
+        "reference answer, even if it omits minor qualifiers or is embedded in a short sentence. "
+        "Answer no if it names a different entity/value, is too vague to identify the reference answer, "
+        "or adds extra conflicting answers. For example, '45 minutes' matches '45 minutes each way', "
+        "but 'Business' does not match 'Business Administration' because it is too generic.\n\n"
+    )
     if abstention:
         return (
             "Judge whether the model correctly says the question cannot be answered from the provided memory.\n\n"
@@ -144,26 +153,44 @@ def get_anscheck_prompt(
         )
     if task in {"single-session-user", "single-session-assistant", "multi-session"}:
         return (
-            "Judge whether the model response fully answers the question with the same meaning as the reference answer.\n\n"
-            f"Question: {question}\n\nCorrect Answer: {answer}\n\nModel Response: {response}\n\n"
+            (
+                lenient_rule
+                if lenient
+                else "Judge whether the model response fully answers the question with the same meaning as the reference answer.\n\n"
+            )
+            + f"Question: {question}\n\nCorrect Answer: {answer}\n\nModel Response: {response}\n\n"
             f"{verdict_line}"
         )
     if task == "temporal-reasoning":
         return (
-            "Judge whether the response matches the reference answer. For day-count answers, allow an off-by-one error.\n\n"
-            f"Question: {question}\n\nCorrect Answer: {answer}\n\nModel Response: {response}\n\n"
+            (
+                lenient_rule + "For day-count answers, also allow an off-by-one error.\n\n"
+                if lenient
+                else "Judge whether the response matches the reference answer. For day-count answers, allow an off-by-one error.\n\n"
+            )
+            + f"Question: {question}\n\nCorrect Answer: {answer}\n\nModel Response: {response}\n\n"
             f"{verdict_line}"
         )
     if task == "knowledge-update":
         return (
-            "Judge whether the response contains the latest correct answer, even if it also mentions older information.\n\n"
-            f"Question: {question}\n\nCorrect Answer: {answer}\n\nModel Response: {response}\n\n"
+            (
+                lenient_rule + "If older information is also mentioned, answer yes only when the latest correct answer is still clear.\n\n"
+                if lenient
+                else "Judge whether the response contains the latest correct answer, even if it also mentions older information.\n\n"
+            )
+            + f"Question: {question}\n\nCorrect Answer: {answer}\n\nModel Response: {response}\n\n"
             f"{verdict_line}"
         )
     if task == "single-session-preference":
         return (
-            "Judge whether the response uses the user's personal preference correctly according to the rubric.\n\n"
-            f"Question: {question}\n\nRubric: {answer}\n\nModel Response: {response}\n\n"
+            (
+                "Use a lenient personalized-answer criterion: answer yes if the response recalls and uses the user's "
+                "main relevant preference correctly, even if it omits minor rubric details. Answer no if it uses a "
+                "different or conflicting preference.\n\n"
+                if lenient
+                else "Judge whether the response uses the user's personal preference correctly according to the rubric.\n\n"
+            )
+            + f"Question: {question}\n\nRubric: {answer}\n\nModel Response: {response}\n\n"
             f"{verdict_line}"
         )
     raise NotImplementedError(f"unsupported question_type: {task}")
@@ -214,6 +241,7 @@ def judge_with_deepseek(
     base_url: str,
     timeout: int,
     max_retries: int,
+    lenient: bool,
 ) -> dict[str, Any]:
     qid = str(entry["question_id"])
     prompt = get_anscheck_prompt(
@@ -222,6 +250,7 @@ def judge_with_deepseek(
         str(entry["answer"]),
         hypothesis,
         abstention="_abs" in qid,
+        lenient=lenient,
     )
     response = deepseek_chat(
         prompt,
@@ -233,6 +262,7 @@ def judge_with_deepseek(
     )
     return {
         "model": model,
+        "lenient": lenient,
         "raw_response": response,
         "label": "yes" in response.lower(),
     }
@@ -260,6 +290,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-chat-template", action="store_true")
     parser.add_argument("--enable-thinking", choices=("auto", "0", "1"), default="auto")
     parser.add_argument("--judge", action="store_true", help="Call DeepSeek API and write eval labels.")
+    parser.add_argument("--judge-lenient", action="store_true", help="Use a looser short-answer equivalence prompt for DeepSeek judging.")
     parser.add_argument("--judge-existing", action="store_true", help="Only judge existing predictions.")
     parser.add_argument("--deepseek-api-key", default=os.environ.get("DEEPSEEK_API_KEY"))
     parser.add_argument("--deepseek-model", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"))
@@ -404,6 +435,7 @@ def main() -> None:
                 base_url=args.deepseek_base_url,
                 timeout=args.deepseek_timeout,
                 max_retries=args.deepseek_max_retries,
+                lenient=args.judge_lenient,
             )
             log_entry = {
                 "question_id": qid,
