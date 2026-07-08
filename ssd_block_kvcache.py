@@ -28,7 +28,7 @@ class SSDBlockKVConfig:
     """
 
     block_size: int = 256
-    top_k_blocks: int = 8
+    top_k_blocks: int = 1000
     summary_layer: int = 0
     replay_position_base: int = 1
     dtype_on_ssd: torch.dtype = torch.float16
