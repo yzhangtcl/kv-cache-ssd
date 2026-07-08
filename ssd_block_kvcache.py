@@ -6,15 +6,11 @@ import json
 import shutil
 import time
 from dataclasses import asdict, dataclass
+from importlib import import_module
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import torch
-
-try:
-    from transformers.cache_utils import DynamicCache
-except Exception:  # pragma: no cover - optional Transformers compatibility shim
-    DynamicCache = None
 
 
 PastKeyValues = tuple[tuple[torch.Tensor, torch.Tensor], ...]
@@ -117,13 +113,55 @@ def _cache_seq_len(past_key_values) -> int:
     return int(entries[0][0].shape[-2])
 
 
+def _dynamic_cache_cls():
+    for module_name in ("transformers.cache_utils", "transformers"):
+        try:
+            module = import_module(module_name)
+        except Exception:
+            continue
+        cls = getattr(module, "DynamicCache", None)
+        if cls is not None:
+            return cls
+    return None
+
+
+def _legacy_tuple_to_dynamic_cache(past_key_values: PastKeyValues):
+    cls = _dynamic_cache_cls()
+    if cls is None:
+        return past_key_values
+
+    from_legacy = getattr(cls, "from_legacy_cache", None)
+    if from_legacy is not None:
+        try:
+            return from_legacy(past_key_values)
+        except Exception:
+            pass
+
+    try:
+        cache = cls()
+    except TypeError:
+        try:
+            cache = cls(config=None)
+        except Exception:
+            return past_key_values
+
+    update = getattr(cache, "update", None)
+    if update is None:
+        return past_key_values
+
+    try:
+        for layer_idx, (key, value) in enumerate(past_key_values):
+            update(key, value, layer_idx)
+        return cache
+    except Exception:
+        return past_key_values
+
+
 def _to_model_cache(past_key_values):
     if past_key_values is None or hasattr(past_key_values, "get_seq_length"):
         return past_key_values
-    if isinstance(past_key_values, tuple) and DynamicCache is not None:
-        from_legacy = getattr(DynamicCache, "from_legacy_cache", None)
-        if from_legacy is not None:
-            return from_legacy(past_key_values)
+    if isinstance(past_key_values, tuple):
+        return _legacy_tuple_to_dynamic_cache(past_key_values)
     return past_key_values
 
 
@@ -693,6 +731,14 @@ def _forward_with_cache(
     position_start: int,
 ):
     past_len = _cache_seq_len(past_key_values)
+    model_cache = _to_model_cache(past_key_values)
+    if isinstance(model_cache, tuple):
+        model_type = getattr(getattr(model, "config", None), "model_type", "")
+        if "qwen3_5" in str(model_type).lower():
+            raise RuntimeError(
+                "failed to convert legacy tuple past_key_values to a Transformers Cache object; "
+                "please check that transformers exposes DynamicCache in this environment"
+            )
     attention_mask = torch.ones(
         (input_ids.shape[0], past_len + int(input_ids.shape[1])),
         device=input_ids.device,
@@ -703,7 +749,7 @@ def _forward_with_cache(
         "attention_mask": attention_mask,
         "position_ids": _position_ids(position_start, int(input_ids.shape[1]), input_ids.device),
         "cache_position": _cache_position(past_len, int(input_ids.shape[1]), input_ids.device),
-        "past_key_values": _to_model_cache(past_key_values),
+        "past_key_values": model_cache,
         "use_cache": True,
     }
     try:
