@@ -45,6 +45,21 @@ def _load_jsonl_by_qid(path: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _limit_per_type(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return rows
+    counts: dict[str, int] = {}
+    selected = []
+    for row in rows:
+        key = str(row.get("question_type", "unknown"))
+        count = counts.get(key, 0)
+        if count >= limit:
+            continue
+        selected.append(row)
+        counts[key] = count + 1
+    return selected
+
+
 def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:160] or "sample"
 
@@ -394,6 +409,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-log", default=None, help="Optional jsonl file for per-question progress events.")
     parser.add_argument("--progress-every", type=int, default=10, help="Log decode progress every N tokens.")
     parser.add_argument("--limit", type=int, default=0, help="0 means all examples.")
+    parser.add_argument("--limit-per-type", type=int, default=0, help="0 means no per-question_type limit.")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--prefill-chunk-tokens", type=int, default=8192)
@@ -425,8 +441,23 @@ def main() -> None:
     log_progress = _make_progress_logger(progress_log)
     data = _json_load(data_file)
     subset = data[args.start :]
+    subset = _limit_per_type(subset, args.limit_per_type)
     if args.limit > 0:
         subset = subset[: args.limit]
+    type_counts: dict[str, int] = {}
+    for entry in subset:
+        key = str(entry.get("question_type", "unknown"))
+        type_counts[key] = type_counts.get(key, 0) + 1
+    log_progress(
+        "dataset_selected",
+        {
+            "total": len(subset),
+            "start": args.start,
+            "limit": args.limit,
+            "limit_per_type": args.limit_per_type,
+            "type_counts": type_counts,
+        },
+    )
 
     predictions = _load_jsonl_by_qid(out_file)
     evals = _load_jsonl_by_qid(eval_log)
