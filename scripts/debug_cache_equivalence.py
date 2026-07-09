@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from model_loader import load_tokenizer_and_model
 from ssd_block_kvcache import (
