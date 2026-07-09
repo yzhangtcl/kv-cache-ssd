@@ -62,9 +62,14 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    if int(getattr(cfg, "num_hidden_layers", 0) or cfg_dict.get("num_hidden_layers", 0) or 0) > 48:
+    arch_text = str(getattr(cfg, "architectures", "")).lower()
+    is_qwen36 = "qwen3.6" in model_path.lower() or "qwen3.6" in arch_text
+    if (
+        int(getattr(cfg, "num_hidden_layers", 0) or cfg_dict.get("num_hidden_layers", 0) or 0) > 48
+        and not is_qwen36
+    ):
         print(
-            "Warning: this config has more than 48 layers; check that MODEL_DIR is not still pointing at the 27B model.",
+            "Warning: this config has more than 48 layers; check that MODEL_DIR is intentional.",
             file=sys.stderr,
         )
 
