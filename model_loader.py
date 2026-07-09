@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import traceback
 from typing import Any
 
 
@@ -38,6 +40,8 @@ def load_tokenizer_and_model(
             model.eval()
             return tokenizer, model
         except Exception as exc:
+            if _debug_model_load_enabled():
+                traceback.print_exc()
             errors.append(f"{class_name}: {type(exc).__name__}: {exc}")
 
     joined = "\n".join(errors)
@@ -73,3 +77,7 @@ def _model_loader_order(model_path: str, transformers) -> tuple[str, ...]:
     if "multimodal" in text or "visual" in text or "qwen3_5" in text:
         return ("AutoModelForMultimodalLM", "AutoModelForCausalLM")
     return ("AutoModelForCausalLM", "AutoModelForMultimodalLM")
+
+
+def _debug_model_load_enabled() -> bool:
+    return os.environ.get("DEBUG_MODEL_LOAD", "0").lower() in {"1", "true", "yes", "on"}
