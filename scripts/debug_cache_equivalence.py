@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from model_loader import load_tokenizer_and_model
 from ssd_block_kvcache import (
     RotaryEmbeddingAdapter,
     SSDBlockKVConfig,
@@ -69,15 +69,7 @@ def main() -> None:
     ssd_dir = os.environ.get("SSD_DIR", "/root/blockdata/data/kvssd-debug")
     prompt = os.environ.get("PROMPT", "请用三句话解释 KV cache 为什么影响长上下文推理速度。")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype="auto",
-        device_map="cuda:0",
-        trust_remote_code=True,
-        attn_implementation="sdpa",
-    )
-    model.eval()
+    tokenizer, model = load_tokenizer_and_model(model_path)
 
     rendered = _render_prompt(tokenizer, prompt)
     input_ids = tokenizer(rendered, return_tensors="pt", add_special_tokens=False)["input_ids"].to("cuda")

@@ -476,19 +476,10 @@ def main() -> None:
         SSDBlockKVConfig = None
         generate_with_ssd_block_kv = None
     else:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
+        from model_loader import load_tokenizer_and_model
         from ssd_block_kvcache import SSDBlockKVConfig, generate_with_ssd_block_kv
 
-        tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_dir,
-            torch_dtype="auto",
-            device_map="cuda:0",
-            trust_remote_code=True,
-            attn_implementation="sdpa",
-        )
-        model.eval()
+        tokenizer, model = load_tokenizer_and_model(args.model_dir)
 
     if args.judge and not args.deepseek_api_key:
         raise RuntimeError("set DEEPSEEK_API_KEY or pass --deepseek-api-key to use --judge")

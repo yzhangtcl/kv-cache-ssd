@@ -145,17 +145,33 @@ def _model_layers(model) -> list:
 
 
 def _uses_linear_attention(model) -> bool:
-    return any(hasattr(layer, "linear_attn") for layer in _model_layers(model))
+    return any(_layer_is_stateful_non_attention(layer) for layer in _model_layers(model))
+
+
+def _layer_is_stateful_non_attention(layer) -> bool:
+    names = [type(layer).__name__.lower()]
+    for attr in ("layer_type", "block_type", "attention_type"):
+        value = getattr(layer, attr, None)
+        if value is not None:
+            names.append(str(value).lower())
+    text = " ".join(names)
+    if any(token in text for token in ("linear", "delta", "mamba", "recurrent")):
+        return True
+    return any(hasattr(layer, attr) for attr in ("linear_attn", "delta_attn", "gated_delta_net"))
+
+
+def _layer_is_attention(layer) -> bool:
+    if hasattr(layer, "self_attn"):
+        return True
+    if _layer_is_stateful_non_attention(layer):
+        return False
+    return False
 
 
 def _attention_layer_indices(model, attention_count: int) -> list[int]:
     layers = _model_layers(model)
     if layers:
-        indices = [
-            idx
-            for idx, layer in enumerate(layers)
-            if hasattr(layer, "self_attn") or not hasattr(layer, "linear_attn")
-        ]
+        indices = [idx for idx, layer in enumerate(layers) if _layer_is_attention(layer)]
         if len(indices) == int(attention_count):
             return indices
 
@@ -167,7 +183,10 @@ def _attention_layer_indices(model, attention_count: int) -> list[int]:
         indices = [
             idx
             for idx, value in enumerate(values)
-            if "linear" not in str(value).lower()
+            if not any(
+                token in str(value).lower()
+                for token in ("linear", "delta", "mamba", "recurrent")
+            )
         ]
         if len(indices) == int(attention_count):
             return indices

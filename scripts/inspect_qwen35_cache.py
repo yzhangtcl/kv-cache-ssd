@@ -6,7 +6,9 @@ import os
 import sys
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig
+
+from model_loader import load_tokenizer_and_model
 
 
 def _shape(value):
@@ -63,15 +65,7 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype="auto",
-        device_map="cuda:0",
-        trust_remote_code=True,
-        attn_implementation="sdpa",
-    )
-    model.eval()
+    tokenizer, model = load_tokenizer_and_model(model_path)
 
     inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
     with torch.inference_mode():
